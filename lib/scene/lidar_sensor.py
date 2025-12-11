@@ -178,6 +178,60 @@ class LiDARSensor:
         ).cpu()
         return pts.view(-1, 3), lidar_intensity.view(-1)
 
+
+    def inverse_projection_two(self, frame, pixel_pose=False):
+        """
+        Range image to world coordinates.
+
+        Args:
+            frame: Input frame.
+            pixel_pose: Tensor of shape [H, W, 6] representing [roll, pitch, yaw, x, y, z]
+                        for each pixel in the range image, which defines the transform
+                        from the vehicle frame to the global frame.
+
+        Returns:
+            pts: Tensor of shape (N, 3) in CPU containing the world coordinates of the points.
+            lidar_intensity: Tensor of shape (N) in CPU containing the intensity values.
+        """
+        sensor2world = self.sensor2world[frame]
+        sensor_center = self.sensor_center[frame]
+
+        lidar_pts_r1 = self.range_image_return1[frame][..., 0]
+        lidar_intensity_r1 = self.range_image_return1[frame][..., 1]
+        pts_r1 = self.range2point(frame, lidar_pts_r1)
+
+        if pixel_pose:
+            pixel_pose_r1 = self.pixel_pose[frame]
+            pts_r1 = apply_pixel_pose(pts_r1, pixel_pose_r1)
+
+        # mask = lidar_intensity_r1 != -1  #!无效点
+        mask1 = (lidar_pts_r1 != 0)
+        pts_r1, lidar_intensity_r1 = pts_r1[mask1], lidar_intensity_r1[mask1]
+
+        lidar_pts_r2 = self.range_image_return2[frame][..., 0]
+        lidar_intensity_r2 = self.range_image_return2[frame][..., 1]
+        pts_r2 = self.range2point(frame, lidar_pts_r2)
+
+        if pixel_pose:
+            pixel_pose_r2 = self.pixel_pose[frame]
+            pts_r2 = apply_pixel_pose(pts_r2, pixel_pose_r2)
+
+        # mask = lidar_intensity_r2 != -1
+        mask2 = (lidar_pts_r2 != 0) #!无效点
+        pts_r2, lidar_intensity_r2 = pts_r2[mask2], lidar_intensity_r2[mask2]
+
+        pts = torch.cat([pts_r1, pts_r2], dim=0).cpu()
+        lidar_intensity = torch.cat(
+            [lidar_intensity_r1, lidar_intensity_r2], dim=0
+        ).cpu() 
+        # mask_all = torch.cat(
+        #     [mask1, mask2], dim=0
+        # ).cpu() 
+
+        return (pts.view(-1, 3).cpu(), lidar_intensity.view(-1).cpu(), \
+            pts_r1.view(-1, 3).cpu(), lidar_intensity_r1.view(-1).cpu())
+
+
     def inverse_projection_with_range(self, frame, range_map, mask):
         """
         Range image to world coordinates.

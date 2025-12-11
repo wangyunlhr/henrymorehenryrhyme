@@ -299,3 +299,446 @@ class SceneLidar(Scene):
                 gaussians.optimizer.zero_grad(set_to_none=True)
 
         return clone_num, split_num, prune_scale_num, prune_opacity_num
+    
+
+class simple_element(Scene):
+    def __init__(self, waymo_raw_pkg, shuffle=True, resize_ratio=1, test=False):
+        # scene_id = (
+        #     str(args.scene_id) if isinstance(args.scene_id, int) else args.scene_id
+        # )
+        # self.output_dir = os.path.join(
+        #     args.model_dir, args.task_name, args.exp_name, "scene_" + scene_id
+        # )
+        # self.model_save_dir = os.path.join(self.output_dir, "models")
+        # os.makedirs(self.model_save_dir, exist_ok=True)
+        self.loaded_iter = None
+        self.camera_extent = 0
+        self.gaussians_assets = [
+            GaussianModel(
+                2, 3, extent=self.camera_extent
+            )
+        ] #!背景gaussian初始化
+
+        lidar: Dict[int, LiDARSensor] = waymo_raw_pkg[0]
+        bboxes: Dict[str, BoundingBox] = waymo_raw_pkg[1]
+
+
+        self.train_lidar = lidar
+
+        self.scene_id = waymo_raw_pkg[2]
+        print("[Loaded] background guassians")
+
+        # initialize objects with bounding boxes
+        if True:
+            obj_ids = list(bboxes.keys())
+            for obj_id in obj_ids:
+                bbox = bboxes[obj_id]
+                _, first_frame, last_frame = general_utils.fill_zeros_with_previous_nonzero_new(
+                    range(0, lidar.num_frames), bbox.frame
+                ) #! 只填补物体出现第一帧到最后一帧之间的跳帧
+
+                abs_velocities = []
+                for frame in range(first_frame, last_frame):
+                    velocity = bbox.frame[frame + 1][0] - bbox.frame[frame][0]
+                    abs_velocities.append(torch.norm(velocity).item())
+                avg_velocity = torch.tensor(abs_velocities).mean().item()
+
+                # if avg_velocity > 0.01 and bbox.object_type == 1:
+                if avg_velocity > 0.01 and (bbox.object_type == 1 or bbox.object_type == 2 or bbox.object_type == 4): #! 修改成车，行人，自行车人都会进行box累积  
+                    extent = (
+                        torch.norm(bbox.size, keepdim=False).item()
+                        * 4
+                    ) 
+                    dynamic_flag = True
+                else:
+                    extent = (
+                        torch.norm(bbox.size, keepdim=False).item()
+                        * 4
+                    ) 
+                    dynamic_flag = False
+                    #!修改成全部的box都保存，但是只有动态车，行人，自行车人进行warp
+                gaussian_model = GaussianModel(
+                    2,
+                    3,
+                    extent=extent,
+                    bounding_box=bbox,
+                    dynamic_flag=dynamic_flag,
+                )
+                gaussian_model.tmp_points_intensities_list = []
+                self.gaussians_assets.append(gaussian_model)
+
+            # if not bboxes:
+            #     print("No dynamic objects in the scene")
+            #     args.dynamic = False
+    
+    def accumulate_frame(self, frame_list, target_frame):
+        # initialize bkgd points
+        all_points = []
+        all_intensity = []
+        all_normal = []
+        all_label = [] #! 0为背景,其他为各自的类别
+
+        # for frame in range(frame_range[0], frame_range[1] + 1): #! 转换成只有训练帧
+        #! 清空gaussian_model.tmp_points_intensities_list
+        for gaussian_model in self.gaussians_assets[1:]:
+            gaussian_model.tmp_points_intensities_list = []
+
+        for frame in frame_list:
+            lidar_pts, lidar_intensity, _ ,_, = self.train_lidar.inverse_projection_two(frame) #! 全部世界坐标系下点云
+
+            points_lidar = o3d.geometry.PointCloud()
+            points_lidar.points = o3d.utility.Vector3dVector(
+                lidar_pts.cpu().numpy().astype(np.float64)
+            )
+            points_lidar.estimate_normals(
+                search_param=o3d.geometry.KDTreeSearchParamKNN(knn=6)
+            )
+            normals = torch.from_numpy(np.asarray(points_lidar.normals)).float()
+            for gaussian_model in self.gaussians_assets[1:]: #!处理不同的box
+                bbox = gaussian_model.bounding_box
+                #!只过滤动态物体，只有动态物体用box对齐
+                if not gaussian_model.dynamic_flag:
+                    continue
+                if frame not in bbox.frame.keys(): #如果这个box在这帧没有，就跳过
+                    continue
+                T = bbox.frame[frame][0].cpu()
+                R = build_rotation(bbox.frame[frame][1])[0].cpu() #! box to world
+                points_in_local = (lidar_pts - T) @ R.inverse().T
+                normals_in_local = normals @ R.inverse().T
+                mask = (torch.abs(points_in_local) < bbox.size.cpu() / 2).all(dim=1)
+                gaussian_model.tmp_points_intensities_list.append( #! label只标记了动态物体，因为只有动态物体需要进行累积，所以构建了gs
+                    (
+                        points_in_local[mask],
+                        lidar_intensity[mask][..., None],
+                        normals_in_local[mask],
+                        (bbox.object_type * torch.ones(points_in_local[mask].shape[0]))[..., None],
+                    )
+                )
+
+                lidar_pts, lidar_intensity = lidar_pts[~mask], lidar_intensity[~mask]
+                normals = normals[~mask]
+
+                
+
+            all_points.append(lidar_pts)
+            all_intensity.append(lidar_intensity)
+            all_normal.append(normals)
+
+
+        all_points = torch.cat(all_points, dim=0)  #! 静态区域的点和normal还是在世界坐标系下
+        all_intensity = torch.cat(all_intensity, dim=0)[..., None]
+        all_normal = torch.cat(all_normal, dim=0)
+        all_label = torch.zeros(all_points.shape[0])[..., None] #! 0为背景,其他为各自的类别
+
+        # hit_probs = torch.ones(all_points.shape[0])
+        # drop_probs = torch.zeros(all_points.shape[0])
+        # ip = torch.stack([all_intensity, hit_probs, drop_probs], dim=1)
+
+        # if args.opt.use_voxel_init:
+        #     points_lidar = o3d.geometry.PointCloud()
+        #     points_lidar.points = o3d.utility.Vector3dVector(
+        #         all_points.cpu().numpy().astype(np.float64)
+        #     )
+        #     points_lidar.colors = o3d.utility.Vector3dVector(
+        #         ip.cpu().numpy().astype(np.float64)
+        #     )
+        #     points_lidar.normals = o3d.utility.Vector3dVector(
+        #         all_normals.cpu().numpy().astype(np.float64)
+        #     )
+        #     ! 不下采样
+        #     downsample_points_lidar = points_lidar.voxel_down_sample(
+        #         voxel_size=args.model.voxel_size
+        #     )
+
+        #     all_points = torch.tensor(
+        #         np.asarray(downsample_points_lidar.points)
+        #     ).float()
+        #     ip = torch.tensor(np.asarray(downsample_points_lidar.colors)).float()
+        #     normals = torch.tensor(np.asarray(downsample_points_lidar.normals)).float()
+        #     all_points = torch.tensor(
+        #         np.asarray(points_lidar.points)
+        #     ).float()
+        #     ip = torch.tensor(np.asarray(points_lidar.colors)).float()
+        #     normals = torch.tensor(np.asarray(points_lidar.normals)).float()
+        # else:
+        #     mask = torch.randperm(all_points.shape[0])[
+        #         : all_points.shape[0] // (frame_range[1] - frame_range[0]) * 5
+        #     ]
+        #     all_points = all_points[mask]
+        #     ip = ip[mask]
+        #     normals = all_normals[mask]
+        # calcualte extent
+        # scene_center = all_points.mean(dim=0)
+        # point_extent = 2 * torch.norm(all_points - scene_center, dim=1)
+        # self.camera_extent = (
+        #     args.model.bkgd_extent_factor
+        #     * torch.quantile(point_extent, 0.90).int().item()
+        # )
+        # self.gaussians_assets[0].extent = self.camera_extent
+
+        # pcd = BasicPointCloud(all_points, ip, normals=normals)
+        # self.gaussians_assets[0].create_from_pcd(pcd, args.opt.use_normal_init)
+        #!静态区域添加点云
+        self.gaussians_assets[0].xyz_set(all_points, all_intensity, all_normal, all_label)
+        # # initialize objects points
+        # points_num = args.model.obj_pt_num
+        for j, gaussian_model in enumerate(self.gaussians_assets[1:]):
+            if not gaussian_model.tmp_points_intensities_list:
+                continue
+            points = torch.cat(
+                [point for point, _, _, _ in gaussian_model.tmp_points_intensities_list],
+                dim=0,
+            )
+            intensities = torch.cat(
+                [
+                    intensitie
+                    for _, intensitie, _, _ in gaussian_model.tmp_points_intensities_list
+                ],
+                dim=0,
+            )
+            normals = torch.cat(
+                [normal for _, _, normal, _ in gaussian_model.tmp_points_intensities_list],
+                dim=0,
+            )
+            labels = torch.cat(
+                [label for _, _, _, label in gaussian_model.tmp_points_intensities_list],
+                dim=0,
+            )
+
+            gaussian_model.xyz_set(points, intensities, normals, labels) #动态点云加载
+            #! 动态区域也不过滤
+        #! warp到目标帧
+        all_means3D = []
+        all_intensitys = []
+        all_normals3D = []
+        all_labels3D = []
+
+        for i, gaussian_model in enumerate(self.gaussians_assets):
+            if i >= 1:
+                if not gaussian_model.tmp_points_intensities_list:
+                    continue
+                bbox = gaussian_model.bounding_box
+                if target_frame not in bbox.frame.keys(): #如果这个box在这帧没有，就跳过
+                    continue
+            # means3D = gaussian_model.get_world_xyz(target_frame)
+            means3D, normals3D = gaussian_model.get_world_xyz_and_normals(target_frame)
+            if i == 0:
+                means3D = means3D.cuda()
+                normals3D = normals3D.cuda()
+            all_means3D.append(means3D)
+            all_intensitys.append(gaussian_model._intensity)
+            all_normals3D.append(normals3D)
+            all_labels3D.append(gaussian_model._labels)
+
+        all_means3D = torch.cat(all_means3D, dim=0)
+        all_intensitys = torch.cat(all_intensitys, dim=0) #!全部是世界坐标系下的结果，才能够对齐
+        all_normals3D = torch.cat(all_normals3D, dim=0)
+        all_labels3D = torch.cat(all_labels3D, dim=0)
+
+        assert all_intensitys.max()< 1.1
+        return all_means3D, all_intensitys, all_normals3D, all_labels3D
+            # if points.shape[0] < points_num:
+            #     extra_num = points_num - points.shape[0]
+            #     extra_points = torch.zeros((extra_num, 3))
+            #     for i in range(3):
+            #         extra_points[:, i] = (
+            #             torch.rand(size=(extra_num,)) * bbox.size[i].cpu()
+            #             + bbox.min_xyz[i].cpu()
+            #         )
+            #     points = torch.cat([points, extra_points], dim=0)
+
+            #     extra_points_intensity = torch.rand(extra_num)
+            #     intensities = torch.cat([intensities, extra_points_intensity], dim=0)
+
+            #     theta = np.random.uniform(0, 2 * np.pi, extra_num)
+            #     phi = np.random.uniform(0, np.pi, extra_num)
+            #     extra_normals = np.zeros((extra_num, 3))
+            #     extra_normals[:, 0] = np.sin(phi) * np.cos(theta)
+            #     extra_normals[:, 1] = np.sin(phi) * np.sin(theta)
+            #     extra_normals[:, 2] = np.cos(phi)
+
+            #     normals = torch.cat(
+            #         [normals, torch.tensor(extra_normals).float()], dim=0
+            #     )
+
+            # elif points.shape[0] > points_num:
+            #     mask = torch.randperm(points.shape[0])[:points_num]
+            #     points = points[mask]
+            #     intensities = intensities[mask]
+            #     normals = normals[mask]
+
+        #     hit_probs = torch.ones(points.shape[0])
+        #     drop_probs = torch.zeros(points.shape[0])
+        #     ip = torch.stack([intensities, hit_probs, drop_probs], dim=1)
+        #     pcd = BasicPointCloud(points, ip, normals=normals)
+        #     gaussian_model.create_from_pcd(pcd, args.opt.use_normal_init)
+        #     del gaussian_model.tmp_points_intensities_list
+
+        # print("[Loaded] object guassians")
+
+    def accumulate_frame_return1(self, frame_list, target_frame):
+        # initialize bkgd points
+        all_points = []
+        all_intensity = []
+        all_normal = []
+        all_label = [] #! 0为背景,其他为各自的类别
+
+        # for frame in range(frame_range[0], frame_range[1] + 1): #! 转换成只有训练帧
+        #! 清空gaussian_model.tmp_points_intensities_list
+        for gaussian_model in self.gaussians_assets[1:]:
+            gaussian_model.tmp_points_intensities_list = []
+
+        for frame in frame_list:
+            _ ,_, lidar_pts, lidar_intensity= self.train_lidar.inverse_projection_two(frame) #! 全部世界坐标系下点云
+
+            points_lidar = o3d.geometry.PointCloud()
+            points_lidar.points = o3d.utility.Vector3dVector(
+                lidar_pts.cpu().numpy().astype(np.float64)
+            )
+            points_lidar.estimate_normals(
+                search_param=o3d.geometry.KDTreeSearchParamKNN(knn=6)
+            )
+            normals = torch.from_numpy(np.asarray(points_lidar.normals)).float()
+            for gaussian_model in self.gaussians_assets[1:]: #!处理不同的box
+                bbox = gaussian_model.bounding_box
+                #!只过滤动态物体，只有动态物体用box对齐
+                if not gaussian_model.dynamic_flag:
+                    continue
+                if frame not in bbox.frame.keys(): #如果这个box在这帧没有，就跳过
+                    continue
+                T = bbox.frame[frame][0].cpu()
+                R = build_rotation(bbox.frame[frame][1])[0].cpu() #! box to world
+                points_in_local = (lidar_pts - T) @ R.inverse().T
+                normals_in_local = normals @ R.inverse().T
+                mask = (torch.abs(points_in_local) < bbox.size.cpu() / 2).all(dim=1)
+                gaussian_model.tmp_points_intensities_list.append( #! label只标记了动态物体，因为只有动态物体需要进行累积，所以构建了gs
+                    (
+                        points_in_local[mask],
+                        lidar_intensity[mask][..., None],
+                        normals_in_local[mask],
+                        (bbox.object_type * torch.ones(points_in_local[mask].shape[0]))[..., None],
+                    )
+                )
+
+                lidar_pts, lidar_intensity = lidar_pts[~mask], lidar_intensity[~mask]
+                normals = normals[~mask]
+
+                
+
+            all_points.append(lidar_pts)
+            all_intensity.append(lidar_intensity)
+            all_normal.append(normals)
+
+
+        all_points = torch.cat(all_points, dim=0)  #! 静态区域的点和normal还是在世界坐标系下
+        all_intensity = torch.cat(all_intensity, dim=0)[..., None]
+        all_normal = torch.cat(all_normal, dim=0)
+        all_label = torch.zeros(all_points.shape[0])[..., None] #! 0为背景,其他为各自的类别
+
+        # hit_probs = torch.ones(all_points.shape[0])
+        # drop_probs = torch.zeros(all_points.shape[0])
+        # ip = torch.stack([all_intensity, hit_probs, drop_probs], dim=1)
+
+        # if args.opt.use_voxel_init:
+        #     points_lidar = o3d.geometry.PointCloud()
+        #     points_lidar.points = o3d.utility.Vector3dVector(
+        #         all_points.cpu().numpy().astype(np.float64)
+        #     )
+        #     points_lidar.colors = o3d.utility.Vector3dVector(
+        #         ip.cpu().numpy().astype(np.float64)
+        #     )
+        #     points_lidar.normals = o3d.utility.Vector3dVector(
+        #         all_normals.cpu().numpy().astype(np.float64)
+        #     )
+        #     ! 不下采样
+        #     downsample_points_lidar = points_lidar.voxel_down_sample(
+        #         voxel_size=args.model.voxel_size
+        #     )
+
+        #     all_points = torch.tensor(
+        #         np.asarray(downsample_points_lidar.points)
+        #     ).float()
+        #     ip = torch.tensor(np.asarray(downsample_points_lidar.colors)).float()
+        #     normals = torch.tensor(np.asarray(downsample_points_lidar.normals)).float()
+        #     all_points = torch.tensor(
+        #         np.asarray(points_lidar.points)
+        #     ).float()
+        #     ip = torch.tensor(np.asarray(points_lidar.colors)).float()
+        #     normals = torch.tensor(np.asarray(points_lidar.normals)).float()
+        # else:
+        #     mask = torch.randperm(all_points.shape[0])[
+        #         : all_points.shape[0] // (frame_range[1] - frame_range[0]) * 5
+        #     ]
+        #     all_points = all_points[mask]
+        #     ip = ip[mask]
+        #     normals = all_normals[mask]
+        # calcualte extent
+        # scene_center = all_points.mean(dim=0)
+        # point_extent = 2 * torch.norm(all_points - scene_center, dim=1)
+        # self.camera_extent = (
+        #     args.model.bkgd_extent_factor
+        #     * torch.quantile(point_extent, 0.90).int().item()
+        # )
+        # self.gaussians_assets[0].extent = self.camera_extent
+
+        # pcd = BasicPointCloud(all_points, ip, normals=normals)
+        # self.gaussians_assets[0].create_from_pcd(pcd, args.opt.use_normal_init)
+        #!静态区域添加点云
+        self.gaussians_assets[0].xyz_set(all_points, all_intensity, all_normal, all_label)
+        # # initialize objects points
+        # points_num = args.model.obj_pt_num
+        for j, gaussian_model in enumerate(self.gaussians_assets[1:]):
+            if not gaussian_model.tmp_points_intensities_list:
+                continue
+            points = torch.cat(
+                [point for point, _, _, _ in gaussian_model.tmp_points_intensities_list],
+                dim=0,
+            )
+            intensities = torch.cat(
+                [
+                    intensitie
+                    for _, intensitie, _, _ in gaussian_model.tmp_points_intensities_list
+                ],
+                dim=0,
+            )
+            normals = torch.cat(
+                [normal for _, _, normal, _ in gaussian_model.tmp_points_intensities_list],
+                dim=0,
+            )
+            labels = torch.cat(
+                [label for _, _, _, label in gaussian_model.tmp_points_intensities_list],
+                dim=0,
+            )
+
+            gaussian_model.xyz_set(points, intensities, normals, labels) #动态点云加载
+            #! 动态区域也不过滤
+        #! warp到目标帧
+        all_means3D = []
+        all_intensitys = []
+        all_normals3D = []
+        all_labels3D = []
+
+        for i, gaussian_model in enumerate(self.gaussians_assets):
+            if i >= 1:
+                if not gaussian_model.tmp_points_intensities_list:
+                    continue
+                bbox = gaussian_model.bounding_box
+                if target_frame not in bbox.frame.keys(): #如果这个box在这帧没有，就跳过
+                    continue
+            # means3D = gaussian_model.get_world_xyz(target_frame)
+            means3D, normals3D = gaussian_model.get_world_xyz_and_normals(target_frame)
+            if i == 0:
+                means3D = means3D.cuda()
+                normals3D = normals3D.cuda()
+            all_means3D.append(means3D)
+            all_intensitys.append(gaussian_model._intensity)
+            all_normals3D.append(normals3D)
+            all_labels3D.append(gaussian_model._labels)
+
+        all_means3D = torch.cat(all_means3D, dim=0)
+        all_intensitys = torch.cat(all_intensitys, dim=0) #!全部是世界坐标系下的结果，才能够对齐
+        all_normals3D = torch.cat(all_normals3D, dim=0)
+        all_labels3D = torch.cat(all_labels3D, dim=0)
+
+        assert all_intensitys.max()< 1.1
+        return all_means3D, all_intensitys, all_normals3D, all_labels3D
