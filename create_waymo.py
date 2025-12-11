@@ -365,9 +365,9 @@ def create_reading_index_split_from_txt(
 
 
 def main(
-    data_dir: str = "/data0/dataset/waymo_1_4_3/",
+    data_dir: str = "/data0/dataset/waymo_1_4_3/", #!原始路径
     mode: str = "training",
-    output_dir: str ="/data1/dataset/debug/",
+    output_dir: str ="/data1/dataset/debug/", #!输出路径
     start_idx: int = 0, #!要修改多次
     clip_len: int = 120, #!要修改多次
     nproc: int = (multiprocessing.cpu_count() - 1),
