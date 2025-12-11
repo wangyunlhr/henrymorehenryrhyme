@@ -1,0 +1,13 @@
+parent_config: "configs/waymo/waymo_base.yaml"
+source_dir: "/data1/dataset/lidar-rt/waymo_perception_v1.4.3/dynamic/1/"
+
+frame_length: [148, 197]
+eval_frames: [158, 168, 178, 197]
+
+# frame_length: [148, 152]
+# eval_frames: [150]
+
+scene_id: wd1
+
+dynamic: True
+
