@@ -39,7 +39,7 @@ from lib.utils.loss_utils import (
 from lib.utils.record_utils import make_recorder
 from ruamel.yaml import YAML
 from tqdm import tqdm
-from lib.utils.kitti_utils import kitti_points_to_range_image
+from lib.utils.kitti_utils import kitti_points_to_range_image, downsample_range_image_nearest
 try:
     from torch.utils.tensorboard import SummaryWriter
 
@@ -195,8 +195,9 @@ def debug_check(args):
     sensor2world = scene.train_lidar.sensor2world[target_frame]
     gt_depth = scene.train_lidar.get_depth(target_frame)
     point_acc_sensor = inverse_transform_point(all_means3D.detach().cpu().numpy(), sensor2world.numpy())
-    generate_range_image = kitti_points_to_range_image(point_acc_sensor, all_intensitys.detach().cpu().numpy())
-
+    generate_range_image = kitti_points_to_range_image(point_acc_sensor, all_intensitys.detach().cpu().numpy(), H=64*4,
+                          W=1024*4) #!生成高分辨率的H*4,W*4
+    downsample_range_image_nearest(generate_range_image, scale=4)
     #! 发现物体错位检查box transform问题
     # viz = MyVisualizer(view_file=None, window_title="BBox Demo")
 
@@ -514,18 +515,56 @@ def create_test_reading_index(data_dir: Path, pkl_file_name: str = 'index_test.p
 
     return data_index
 
+
+def parse_args():
+    p = argparse.ArgumentParser("KITTI-360 clip generator")
+    p.add_argument("--data_dir", type=str, default="/data1/dataset/KITTI-360/",
+                   help="KITTI-360 root dir")
+
+    # 用法示例：--seq_list 0000 0002
+    p.add_argument("--seq_list", type=str, nargs="+", default=["0000"],
+                   help="Sequence ids, e.g. 0000 0002 0003")
+
+    p.add_argument("--start_id", type=int, default=0,
+                   help="Start frame id for the clip")
+    p.add_argument("--clip_size", type=int, default=20,
+                   help="Number of frames in one clip")
+
+    p.add_argument("--output_dir", type=str, default=None,
+                   help="Output directory. If not set, use /data0/dataset/debug/<first_seq>/")
+
+    # 进程数：默认 cpu_count-1
+    p.add_argument("--nproc", type=int, default=max(1, multiprocessing.cpu_count() - 1),
+                   help="Number of processes")
+
+    return p.parse_args()
+
+
 if __name__ == "__main__":
     seq_list_all = sorted(['0000','0002','0003','0004','0005','0006','0007','0009','0010'])
     #! 生成数据
     # main_kitti()
     seq = seq_list_all[:1] #!不同的seq,要修改多次
+    args = parse_args()
+    # main_kitti(
+    #     data_dir = "/data1/dataset/KITTI-360/", #!原始路径
+    #     output_dir = f"/data0/dataset/debug/{seq[0]}/", 
+    #     seq_list = seq,
+    #     start_id = 0, #!要修改多次0,20,40.....
+    #     clip_size = 20,
+    #     nproc = (multiprocessing.cpu_count() - 1),
+    # )
+    if args.output_dir is None:
+        args.output_dir = f"/data0/dataset/debug/{args.seq_list[0]}/" #! 保存路径要修改
+    os.makedirs(args.output_dir, exist_ok=True)
+
     main_kitti(
-        data_dir = "/data1/dataset/KITTI-360/", #!原始路径
-        output_dir = f"/data0/dataset/debug/{seq[0]}/", 
-        seq_list = seq,
-        start_id = 0, #!要修改多次0,20,40.....
-        clip_size = 20,
-        nproc = (multiprocessing.cpu_count() - 1),
+        data_dir=args.data_dir,
+        output_dir=args.output_dir,
+        seq_list=args.seq_list,
+        start_id=args.start_id,
+        clip_size=args.clip_size,
+        nproc=args.nproc,
     )
     #! 生成索引
     # create_train_reading_index(data_dir = '/data0/dataset/KITTI-360_h5/', pkl_file_name = 'index_train.pkl')

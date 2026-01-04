@@ -6,6 +6,15 @@
 
 脚本：`create_waymo.py`
 
+```bash
+python create_waymo.py \
+  --data_dir /data0/dataset/waymo_1_4_3/ \
+  --mode training \
+  --output_dir /data0/dataset/debug/ \
+  --start_idx 0 \
+  --clip_len 120 \
+```
+
 - `start_id` 是序列编号  
 - `clip_len` 表示当前一共处理多少个
 
@@ -17,9 +26,10 @@
 ## 2. KITTI 数据处理代码
 
 脚本：`create_kitti.py`
+seq_list_all = sorted(['0000','0002','0003','0004','0005','0006','0007','0009','0010'])
 
 ```bash
-python main_kitti.py \
+python create_kitti.py \
   --seq_list 0000 \
   --start_id 0 \
   --clip_size 20
