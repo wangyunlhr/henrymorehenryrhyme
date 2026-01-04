@@ -23,7 +23,8 @@ python main_kitti.py \
   --seq_list 0000 \
   --start_id 0 \
   --clip_size 20
-  
+```
+
 - `seq` 是序列编号  
 - 已经设定每 **200 帧** 是一个块  
 - `start_id` 表示第一个块编号  
